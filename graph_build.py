@@ -1,4 +1,5 @@
 import networkx as nx
+import matplotlib.pyplot as plt
 
 def build_graph():
     G = nx.DiGraph()
@@ -13,4 +14,6 @@ def build_graph():
     ]
     for u, v, r in edge_data:
         G.add_edge(u, v, rate=r)
+    nx.draw(G,with_labels=True, node_color='lightblue', font_weight='bold')
+    plt.show()
     return G, src, mon
