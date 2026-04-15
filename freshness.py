@@ -1,29 +1,40 @@
 import numpy as np
-def universal_freshness(G, S, source=0):
-    """
-    G: NetworkX DiGraph
-    S: List of chosen edges (u, v)
-    source: The node with age 0
-    """
+from scipy.linalg import solve
+import networkx as nx
+
+def solve_shs(G, active_edges, src=0):
     n = G.number_of_nodes()
     A = np.zeros((n, n))
-    b = -np.ones(n) # The '-1' represents the linear aging over time
-
-    for (u, v) in S:
-        rate = G.edges[u, v]['rate']
-        A[v, u] += rate   # Flow of fresh information from u to v
-        A[v, v] -= rate   # Rate of departure from old state at v
-
-    # Boundary condition: Source age is always 0
-    A[source, :] = 0
-    A[source, source] = -1
-    b[source] = 0
-
-    # Solve the system
+    b = -np.ones(n)
+    for (u, v) in active_edges:
+        r = G.edges[u, v]['rate']
+        A[v, u] += r
+        A[v, v] -= r
+    A[src, :] = 0.0
+    A[src, src] = -1.0
+    b[src] = 0.0
+    for i in range(n):
+        if A[i, i] == 0.0: A[i, i] = -1e-5
     try:
-        expected_ages = np.linalg.solve(A, b)
-        # Ensure we don't have negative age due to numerical instability
-        expected_ages = np.maximum(expected_ages, 0) 
-        return 1.0 / np.mean(expected_ages)
-    except np.linalg.LinAlgError:
-        return 0.0 # Network is disconnected
+        return np.maximum(solve(A, b), 0.01)
+    except:
+        return np.ones(n) * 500.0
+
+def universal_freshness(G, active_edges, src):
+    # Create the graph and immediately add all nodes from the original G
+    H = nx.DiGraph()
+    H.add_nodes_from(G.nodes()) 
+    H.add_edges_from(active_edges)
+    
+    # Now nx.descendants will work even if active_edges is empty
+    reachable_nodes = {src} | nx.descendants(H, src)
+    
+    # Calculate SHS ages
+    ages = solve_shs(G, active_edges, src)
+    
+    # Calculate freshness based on reachable nodes
+    # Using 1/Age sum to reward reaching more nodes with lower age
+    reachable_ages = [ages[i] for i in reachable_nodes]
+    total_freshness = sum(1.0 / age for age in reachable_ages)
+    
+    return total_freshness
