@@ -8,7 +8,7 @@ from greedoidal_chosing import greedoidal
 from matroidal_chosing import matroidal
 
 max_time=20
-k=10#max number of links that can be activated
+k=5#max number of links that can be activated
 
 G,src,mon=build_graph()
 results=simulate_ctmc(Q,0,100)
@@ -32,7 +32,26 @@ plt.title('Greedoidal Selection')
 plt.subplot(2,1,2)
 nx.draw(Matroidal_graph,with_labels=True, node_color='lightgreen', font_weight='bold')
 plt.title('Matroidal Selection')
+plt.subplot(2,2,1)
+# Add plot for freshness values
+plt.plot(freshness_greedoidal, label='Greedoidal')
+plt.plot(freshness_matroidal, label='Matroidal')
+plt.xlabel('Time')
+plt.ylabel('Freshness')
+plt.title('Freshness Comparison')
+plt.legend()
+plt.subplot(2,2,2)
+# Add plot for best scores
+plt.plot(best_score_greedoidal, label='Greedoidal')
+plt.plot(best_score_matroidal, label='Matroidal')
+plt.xlabel('Time')
+plt.ylabel('Best Score')
+plt.title('Best Score Comparison')
+plt.legend()
+plt.tight_layout()
 plt.show()
+
+
 
 
 

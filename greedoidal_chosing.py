@@ -1,7 +1,7 @@
 import networkx as nx
 from freshness import universal_freshness
 
-def greedoidal(G,k,src,weight=0.2):
+def greedoidal(G,k,src,weight=0.4):
     """Greedoid: Only picks edges reachable from source."""
     sel, rem, fh, gh = [], list(G.edges()), [], []
     for _ in range(k):

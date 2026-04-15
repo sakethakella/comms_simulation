@@ -1,35 +1,23 @@
 """
 =============================================================================
-  VERSION AGE MINIMIZATION — SHS + CTMC + SUBMODULAR LINK SELECTION
-  Matroidal vs Greedoidal Greedy  |  Gossip Network AoI Optimization
+  CTMC-DRIVEN ADAPTIVE LINK SELECTION WITH REAL-TIME FRESHNESS SCORING
 =============================================================================
 
-THEORETICAL BACKGROUND:
-  In the AoI/SHS setting, the freshness function f(S) = 1/mean(E[X]) has a
-  remarkable property: any edge (u,v) whose tail u is not reachable from the
-  source in the current active set S contributes ZERO marginal gain.
-  This means the matroid and greedoid greedy algorithms select the SAME edges
-  in the SAME order -- the physical routing constraint (greedoid) is already
-  ENCODED in the information-theoretic objective (SHS).
+  HOW IT WORKS:
+  ─────────────
+  1. A CTMC (Gillespie) runs continuously as the "ground truth" dynamics.
+  2. The MONITOR NODE acts as a sensor — whenever it detects a version-age
+     spike (stale detection), it TRIGGERS a re-evaluation of the network.
+  3. On trigger, the SHS moment equations are solved to compute current
+     expected ages E[X] → freshness f(S) for every candidate link.
+  4. The MATROIDAL or GREEDOIDAL greedy then selects the best k links
+     based on that freshness score.
+  5. The newly selected links are ACTIVATED in the CTMC going forward.
+  6. We repeat: CTMC runs → sensor detects staleness → re-score →
+     reselect links → CTMC resumes with new topology.
 
-  This is a positive result: the greedoid constraint comes for free!
-  The theoretical distinction is in the GUARANTEES:
-    - Matroid  constraint: (1-1/e)*OPT  -- cardinality constraint only
-    - Greedoid constraint: 1/(1+alpha)*OPT -- routing + accessibility
-
-  To visualize meaningful differences, we compare FOUR policies:
-    1. Greedy (Matroidal/Greedoidal -- both identical as proved)  <- BEST
-    2. Degree-based heuristic (pick highest-rate links greedily)  <- NAIVE
-    3. Random link selection                                       <- BASELINE
-    4. No links (k=0)                                             <- WORST
-  
-  We show freshness curves, marginal gains, CTMC convergence,
-  and steady-state age under each policy.
-
-ALGORITHMS (Nemhauser-Wolsey-Fisher 1978 + Fisher-Nemhauser-Wolsey 1978):
-  Matroid I_k = {S : |S| <= k}  -- greedy yields (1-1/e) approximation
-  Greedoid F(S) = reachable frontier from source -- greedy yields 1/(1+c)
-  In SHS setting: F(S) = argmax candidates always, so both coincide.
+  This creates a closed feedback loop:
+      CTMC dynamics → sensor trigger → SHS scoring → link selection → CTMC
 """
 
 import numpy as np
@@ -39,13 +27,12 @@ import matplotlib.patches as mpatches
 import matplotlib.gridspec as gridspec
 from scipy.linalg import solve
 import warnings
-warnings.filterwarnings("ignore")
 import os
-out = 'version_age_simulation.png'
+warnings.filterwarnings("ignore")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 1.  Graph
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# 1.  GRAPH
+# ══════════════════════════════════════════════════════════════════════════
 
 def build_graph():
     G = nx.DiGraph()
@@ -63,12 +50,12 @@ def build_graph():
     return G, src, mon
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 2.  SHS Solver
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# 2.  SHS MOMENT SOLVER  →  f(S)
+# ══════════════════════════════════════════════════════════════════════════
 
 def solve_shs(G, active_edges, src=0):
-    """Solve linearised SHS: A·E[X] = b  (lattice homomorphism approach)."""
+    """Solve A·E[X] = b (linearised SHS via lattice homomorphism)."""
     n = G.number_of_nodes()
     A = np.zeros((n, n))
     b = -np.ones(n)
@@ -89,60 +76,44 @@ def solve_shs(G, active_edges, src=0):
 
 
 def freshness(G, active_edges, src=0):
+    """f(S) = 1 / mean(E[X])  — submodular objective."""
     if not active_edges:
         return 1e-5
     return 1.0 / np.mean(solve_shs(G, active_edges, src))
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 3.  Greedy Algorithms
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# 3.  LINK SELECTION ALGORITHMS  (triggered by sensor)
+# ══════════════════════════════════════════════════════════════════════════
 
-def matroidal_greedy(G, k, src=0, weight_factor=0.2):
+def matroidal_select(G, k, src=0):
     """
-    Modified Matroidal Greedy:
-    Any k edges can be picked. It is tempted by high-rate links 
-    even if they don't provide immediate reachability to the source.
+    Matroidal Greedy: pick any k edges maximising marginal freshness gain.
+    Guarantee: f(S) >= (1-1/e)*f(OPT).
     """
-    sel, rem, fh, gh = [], list(G.edges()), [], []
-    
+    sel, rem = [], list(G.edges())
     for _ in range(k):
         fc = freshness(G, sel, src)
-        best_score, best_e = -1.0, None
-        
+        best_g, best_e = -1.0, None
         for e in rem:
-            # Objective: Freshness Gain + Weighted Link Rate
-            # This 'tempts' the matroid to pick disconnected high-rate links
-            gain = freshness(G, sel + [e], src) - fc
-            local_utility = weight_factor * G.edges[e]['rate']
-            score = gain + local_utility
-            
-            if score > best_score:
-                best_score, best_e = score, e
-                
-        if best_e is None:
+            g = freshness(G, sel + [e], src) - fc
+            if g > best_g:
+                best_g, best_e = g, e
+        if best_e is None or best_g <= 1e-10:
             break
-            
         sel.append(best_e)
         rem.remove(best_e)
-        
-        # Track actual SHS freshness for the plot
-        current_f = freshness(G, sel, src)
-        fh.append(current_f)
-        gh.append(best_score)
-        
-    return sel, fh, gh
+    return sel
 
 
-def greedoidal_greedy(G, k, src=0, weight_factor=0.2):
+def greedoidal_select(G, k, src=0):
     """
-    Proper Greedoidal Greedy:
-    Can ONLY pick edges from the reachable frontier.
+    Greedoidal Greedy: pick edges only from the reachable frontier.
+    F(S) = {(u,v) : u reachable from src in S}.
+    Guarantee: f(S) >= f(OPT)/(1+curvature).
     """
-    sel, rem, fh, gh = [], list(G.edges()), [], []
-    
+    sel, rem = [], list(G.edges())
     for _ in range(k):
-        # Determine reachable set from source S
         if sel:
             H = nx.DiGraph()
             H.add_nodes_from(G.nodes())
@@ -150,222 +121,190 @@ def greedoidal_greedy(G, k, src=0, weight_factor=0.2):
             reach = {src} | nx.descendants(H, src)
         else:
             reach = {src}
-            
-        # Only edges starting from the reachable set are valid
         frontier = [e for e in rem if e[0] in reach]
-        
         if not frontier:
             break
-            
         fc = freshness(G, sel, src)
-        best_score, best_e = -1.0, None
-        
+        best_g, best_e = -1.0, None
         for e in frontier:
-            gain = freshness(G, sel + [e], src) - fc
-            local_utility = weight_factor * G.edges[e]['rate']
-            score = gain + local_utility
-            
-            if score > best_score:
-                best_score, best_e = score, e
-                
-        if best_e is None:
+            g = freshness(G, sel + [e], src) - fc
+            if g > best_g:
+                best_g, best_e = g, e
+        if best_e is None or best_g <= 1e-10:
             break
-            
         sel.append(best_e)
         rem.remove(best_e)
-        fh.append(freshness(G, sel, src))
-        gh.append(best_score)
-        
-    return sel, fh, gh
-
-def rate_greedy(G, k, src=0):
-    """Naive heuristic: pick k highest-rate edges (no submodular awareness)."""
-    sorted_e = sorted(G.edges(), key=lambda e: G.edges[e]['rate'], reverse=True)
-    sel = sorted_e[:k]
-    fh = [freshness(G, sel[:i+1], src) for i in range(len(sel))]
-    return sel, fh
+    return sel
 
 
-def random_policy(G, k, src=0, seed=42):
-    """Random baseline: pick k edges uniformly at random."""
-    rng = np.random.default_rng(seed)
-    all_e = list(G.edges())
-    sel = list(rng.choice(len(all_e), min(k, len(all_e)), replace=False))
-    sel = [all_e[i] for i in sel]
-    fh = [freshness(G, sel[:i+1], src) for i in range(len(sel))]
-    return sel, fh
+# ══════════════════════════════════════════════════════════════════════════
+# 4.  CTMC ENGINE WITH SENSOR TRIGGER
+# ══════════════════════════════════════════════════════════════════════════
 
+def run_ctmc_adaptive(G, src, mon, k,
+                      algo='matroid',
+                      src_rate=1.5,
+                      stale_threshold=5,
+                      reselect_cooldown=8.0,
+                      T_max=300.0,
+                      seed=42):
+    """
+    CTMC simulation with sensor-triggered link reselection.
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 4.  Curvature
-# ═══════════════════════════════════════════════════════════════════════════
+    Parameters
+    ----------
+    stale_threshold  : version-age value that triggers a sensor alarm
+    reselect_cooldown: minimum time between reselections (prevent thrashing)
+    algo             : 'matroid' or 'greedoid'
 
-def compute_curvature(G, sel, src=0):
-    if len(sel) < 2:
-        return 0.0
-    f0 = freshness(G, [], src)
-    ratios = []
-    for i, e in enumerate(sel):
-        d_alone = freshness(G, [e], src) - f0
-        rest = [x for j, x in enumerate(sel) if j != i]
-        d_rest = freshness(G, rest + [e], src) - freshness(G, rest, src)
-        if d_alone > 1e-12:
-            ratios.append(max(0.0, d_rest / d_alone))
-    return max(0.0, min(1.0, 1.0 - min(ratios))) if ratios else 0.0
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 5.  CTMC Simulation
-# ═══════════════════════════════════════════════════════════════════════════
-
-def simulate_ctmc(G, active_edges, src=0, mon=None,
-                  src_rate=1.5, T_max=120.0, seed=0):
+    Returns
+    -------
+    dict with full trace data for plotting
+    """
     rng = np.random.default_rng(seed)
     n = G.number_of_nodes()
-    if mon is None:
-        mon = n - 1
-    ver = np.zeros(n, dtype=int)
-    t = 0.0; times, ages = [0.0], [0]
-    rm = {(u, v): G.edges[u, v]['rate'] for (u, v) in active_edges}
-    while t < T_max:
-        evts = [('s',)]; rats = [src_rate]
-        for (u, v), r in rm.items():
-            if ver[u] > ver[v]:
-                evts.append(('c', u, v)); rats.append(r)
-        total = sum(rats)
-        if total == 0: break
-        t += rng.exponential(1.0 / total)
-        idx = rng.choice(len(evts), p=np.array(rats) / total)
-        ev = evts[idx]
-        if ev[0] == 's':
-            ver[src] += 1
-        else:
-            ver[ev[2]] = ver[ev[1]]
-        ages.append(max(0, ver[src] - ver[mon]))
-        times.append(t)
-    ta, aa = np.array(times), np.array(ages)
-    cut = max(1, int(len(aa) * 0.4))
-    return ta, aa, float(np.mean(aa[cut:]))
 
+    # ── Initial link selection ──────────────────────────────────────────
+    selector = matroidal_select if algo == 'matroid' else greedoidal_select
+    active = selector(G, k, src)
+    f_init = freshness(G, active, src)
 
-def ctmc_curve(G, edge_seq, src=0, mon=None, T_max=70.0):
-    return [simulate_ctmc(G, edge_seq[:k], src, mon, T_max=T_max, seed=k)[2]
-            for k in range(1, len(edge_seq) + 1)]
-
-
-def ctmc_age_per_node(G, active_edges, src=0, T_max=300.0, seed=7):
-    """Run CTMC and return mean steady-state age per node."""
-    rng = np.random.default_rng(seed)
-    n = G.number_of_nodes()
-    ver = np.zeros(n, dtype=int)
+    # ── State ───────────────────────────────────────────────────────────
+    version = np.zeros(n, dtype=int)
     t = 0.0
-    node_acc = {i: [] for i in range(n)}
-    rm = {(u, v): G.edges[u, v]['rate'] for (u, v) in active_edges}
+
+    # ── Records ─────────────────────────────────────────────────────────
+    times          = [0.0]
+    ages           = [0]
+    freshness_log  = [f_init]      # freshness score at each reselection
+    trigger_times  = []            # when sensor fired
+    trigger_ages   = []            # version age at trigger
+    active_log     = [list(active)]# link sets over time
+    reselect_times = [0.0]         # wall-clock times of reselections
+    reselect_count = 0
+    last_reselect  = -reselect_cooldown   # allow immediate first trigger
+
+    rm = {(u, v): G.edges[u, v]['rate'] for (u, v) in active}
+
     while t < T_max:
-        evts = [('s',)]; rats = [1.5]
+        # Build event list
+        evts = [('s',)]
+        rats = [src_rate]
         for (u, v), r in rm.items():
-            if ver[u] > ver[v]:
-                evts.append(('c', u, v)); rats.append(r)
+            if version[u] > version[v]:
+                evts.append(('c', u, v))
+                rats.append(r)
+
         total = sum(rats)
-        if total == 0: break
-        t += rng.exponential(1.0 / total)
+        if total == 0:
+            break
+
+        dt = rng.exponential(1.0 / total)
+        t += dt
+
+        # Apply event
         idx = rng.choice(len(evts), p=np.array(rats) / total)
         ev = evts[idx]
         if ev[0] == 's':
-            ver[src] += 1
+            version[src] += 1
         else:
-            ver[ev[2]] = ver[ev[1]]
-        for i in range(n):
-            node_acc[i].append(max(0, ver[src] - ver[i]))
-    cut = max(1, int(sum(len(v) for v in node_acc.values()) / n * 0.4))
-    return {i: float(np.mean(v[cut:])) if len(v) > cut else float(np.mean(v))
-            for i, v in node_acc.items()}
+            version[ev[2]] = version[ev[1]]
 
+        current_age = max(0, version[src] - version[mon])
+        times.append(t)
+        ages.append(current_age)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 6.  Run Everything
-# ═══════════════════════════════════════════════════════════════════════════
+        # ── SENSOR DETECTION ─────────────────────────────────────────
+        # Monitor node detects staleness when age exceeds threshold
+        if (current_age >= stale_threshold and
+                t - last_reselect >= reselect_cooldown):
 
-def run_all(k=10):
-    G, src, mon = build_graph()
-    print(f"Graph: {G.number_of_nodes()} nodes  {G.number_of_edges()} edges"
-          f"  |  src={src}  mon={mon}  k={k}\n")
+            trigger_times.append(t)
+            trigger_ages.append(current_age)
 
-    print("Matroidal greedy ...")
-    m_e, m_fh, m_gh = matroidal_greedy(G, k, src)
-    print("Greedoidal greedy ...")
-    g_e, g_fh, g_gh = greedoidal_greedy(G, k, src)
-    print("Rate heuristic ...")
-    r_e, r_fh = rate_greedy(G, k, src)
-    print("Random policy ...")
-    rand_e, rand_fh = random_policy(G, k, src)
+            # Reselect links based on CURRENT SHS scoring
+            new_active = selector(G, k, src)
+            f_new = freshness(G, new_active, src)
 
-    same = (m_e == g_e)
-    c = compute_curvature(G, m_e, src)
-    ab = 1.0 / (1.0 + c)
-    fm = m_fh[-1] if m_fh else 0
-    fg = g_fh[-1] if g_fh else 0
-    ratio = fg / fm if fm > 0 else 0.0
+            active = new_active
+            rm = {(u, v): G.edges[u, v]['rate'] for (u, v) in active}
+            freshness_log.append(f_new)
+            active_log.append(list(active))
+            reselect_times.append(t)
+            last_reselect = t
+            reselect_count += 1
 
-    # Freshness of all-edges (upper bound)
-    f_all = freshness(G, list(G.edges()), src)
-
-    print(f"\n  Matroid == Greedoid sequences: {same}  (theorem: always True in SHS)")
-    print(f"  curvature α={c:.4f}  greedoid bound 1/(1+α)={ab:.4f}")
-    print(f"  f_greedy={fm:.5f}  f_all={f_all:.5f}  ratio={fm/f_all:.4f}")
-    print(f"  (1-1/e)·f_all = {(1-1/np.e)*f_all:.5f}")
-
-    print("\nCTMC convergence curves ...")
-    m_ca   = ctmc_curve(G, m_e,   src, mon, T_max=70.0)
-    g_ca   = ctmc_curve(G, g_e,   src, mon, T_max=70.0)
-    r_ca   = ctmc_curve(G, r_e,   src, mon, T_max=70.0)
-    rand_ca= ctmc_curve(G, rand_e,src, mon, T_max=70.0)
-
-    print("Full CTMC traces ...")
-    m_t, m_a, _    = simulate_ctmc(G, m_e,    src, mon, T_max=220.0, seed=77)
-    r_t, r_a, _    = simulate_ctmc(G, r_e,    src, mon, T_max=220.0, seed=77)
-    rand_t, rand_a, _ = simulate_ctmc(G, rand_e, src, mon, T_max=220.0, seed=77)
-    all_t, all_a, _= simulate_ctmc(G, list(G.edges()), src, mon, T_max=220.0, seed=77)
-
-    print("Per-node ages (greedy policy) ...")
-    node_ages_shs  = solve_shs(G, m_e, src)
-    node_ages_ctmc = ctmc_age_per_node(G, m_e, src, T_max=300.0)
+    print(f"  [{algo.upper():8s}] reselections={reselect_count:3d}  "
+          f"final_f={freshness_log[-1]:.4f}  "
+          f"mean_age={np.mean(ages[len(ages)//2:]):.2f}")
 
     return dict(
-        G=G, src=src, mon=mon, k=k,
-        m_e=m_e, m_fh=m_fh, m_gh=m_gh,
-        g_e=g_e, g_fh=g_fh, g_gh=g_gh,
-        r_e=r_e, r_fh=r_fh,
-        rand_e=rand_e, rand_fh=rand_fh,
-        m_ca=m_ca, g_ca=g_ca, r_ca=r_ca, rand_ca=rand_ca,
-        m_t=m_t, m_a=m_a,
-        r_t=r_t, r_a=r_a,
-        rand_t=rand_t, rand_a=rand_a,
-        all_t=all_t, all_a=all_a,
-        c=c, ratio=ratio, ab=ab, f_all=f_all,
-        node_ages_shs=node_ages_shs,
-        node_ages_ctmc=node_ages_ctmc,
+        times=np.array(times),
+        ages=np.array(ages),
+        freshness_log=freshness_log,
+        trigger_times=trigger_times,
+        trigger_ages=trigger_ages,
+        active_log=active_log,
+        reselect_times=reselect_times,
+        final_active=active,
+        reselect_count=reselect_count,
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 7.  Visualization
-# ═══════════════════════════════════════════════════════════════════════════
+# Static (no reselection) baseline
+def run_ctmc_static(G, src, mon, active, src_rate=1.5, T_max=300.0, seed=42):
+    rng = np.random.default_rng(seed)
+    n = G.number_of_nodes()
+    version = np.zeros(n, dtype=int)
+    t = 0.0
+    times, ages = [0.0], [0]
+    rm = {(u, v): G.edges[u, v]['rate'] for (u, v) in active}
+    while t < T_max:
+        evts = [('s',)]; rats = [src_rate]
+        for (u, v), r in rm.items():
+            if version[u] > version[v]:
+                evts.append(('c', u, v)); rats.append(r)
+        total = sum(rats)
+        if total == 0: break
+        t += rng.exponential(1.0 / total)
+        idx = rng.choice(len(evts), p=np.array(rats) / total)
+        ev = evts[idx]
+        if ev[0] == 's': version[src] += 1
+        else: version[ev[2]] = version[ev[1]]
+        ages.append(max(0, version[src] - version[mon]))
+        times.append(t)
+    return np.array(times), np.array(ages)
 
-BLUE   = '#4fc3f7'
-ORANGE = '#ffb74d'
-GREEN  = '#81c784'
-PURPLE = '#ce93d8'
-GOLD   = '#ffd54f'
-PINK   = '#f48fb1'
-RED    = '#ef9a9a'
-GRAY   = '#90a4ae'
+
+# ══════════════════════════════════════════════════════════════════════════
+# 5.  ROLLING MEAN HELPER
+# ══════════════════════════════════════════════════════════════════════════
+
+def rmean(arr, w=250):
+    if len(arr) < w:
+        return np.arange(len(arr)), np.array(arr, dtype=float)
+    ys = np.convolve(arr, np.ones(w) / w, mode='valid')
+    return np.arange(len(ys)), ys
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 6.  VISUALIZATION
+# ══════════════════════════════════════════════════════════════════════════
+
+DARK   = '#0f1117'
 BG     = '#1a1d27'
 GRID   = '#2a2d3a'
-DARK   = '#0f1117'
+GRAY   = '#90a4ae'
+BLUE   = '#4fc3f7'
+GREEN  = '#81c784'
+ORANGE = '#ffb74d'
+PINK   = '#f48fb1'
+GOLD   = '#ffd54f'
+RED    = '#ef9a9a'
+PURPLE = '#ce93d8'
 
 
-def sax(ax, title=''):
+def sax(ax, title='', xlabel='', ylabel=''):
     ax.set_facecolor(BG)
     ax.tick_params(colors=GRAY, labelsize=8)
     ax.xaxis.label.set_color(GRAY)
@@ -374,233 +313,292 @@ def sax(ax, title=''):
         sp.set_edgecolor(GRID)
     ax.grid(True, color=GRID, lw=0.6, alpha=0.8)
     if title:
-        ax.set_title(title, color='white', fontsize=9.5,
-                     fontweight='bold', pad=7)
+        ax.set_title(title, color='white', fontsize=9.5, fontweight='bold', pad=7)
+    if xlabel:
+        ax.set_xlabel(xlabel, fontsize=9)
+    if ylabel:
+        ax.set_ylabel(ylabel, fontsize=9)
 
 
-def draw_topo(ax, G, pos, sel, src, mon, nc, ec, title, show_rates=False):
+def draw_topo(ax, G, pos, sel, src, mon, ec, title):
     ax.set_facecolor(BG)
     ax.set_title(title, color='white', fontsize=9, fontweight='bold', pad=6)
     others = [v for v in G.nodes() if v not in [src, mon]]
-    nx.draw_networkx_edges(G, pos, ax=ax, edge_color=GRAY, alpha=0.11,
+    # Background edges
+    nx.draw_networkx_edges(G, pos, ax=ax, edge_color=GRAY, alpha=0.10,
                            arrows=True, arrowsize=8, width=0.5,
                            connectionstyle='arc3,rad=0.15')
+    # Active selected edges
     if sel:
-        nx.draw_networkx_edges(G, pos, ax=ax, edgelist=sel,
-                               edge_color=ec, alpha=0.92,
-                               arrows=True, arrowsize=14, width=2.5,
-                               connectionstyle='arc3,rad=0.15')
+        H = nx.DiGraph(); H.add_nodes_from(G.nodes()); H.add_edges_from(sel)
+        reach = {src} | nx.descendants(H, src)
+        live  = [e for e in sel if e[0] in reach]
+        dead  = [e for e in sel if e[0] not in reach]
+        if live:
+            nx.draw_networkx_edges(G, pos, ax=ax, edgelist=live,
+                                   edge_color=ec, alpha=0.92,
+                                   arrows=True, arrowsize=14, width=2.5,
+                                   connectionstyle='arc3,rad=0.15')
+        if dead:
+            nx.draw_networkx_edges(G, pos, ax=ax, edgelist=dead,
+                                   edge_color=RED, alpha=0.5,
+                                   arrows=True, arrowsize=10, width=1.5,
+                                   style='dashed',
+                                   connectionstyle='arc3,rad=0.15')
     nx.draw_networkx_nodes(G, pos, ax=ax, nodelist=[src],
-                           node_color=GOLD, node_size=900, node_shape='*')
+                           node_color=GOLD, node_size=800, node_shape='*')
     nx.draw_networkx_nodes(G, pos, ax=ax, nodelist=[mon],
-                           node_color=PINK, node_size=600, node_shape='D')
+                           node_color=PINK,  node_size=550, node_shape='D')
     nx.draw_networkx_nodes(G, pos, ax=ax, nodelist=others,
-                           node_color=nc, node_size=320, alpha=0.8)
-    nx.draw_networkx_labels(G, pos, ax=ax, font_color='white',
-                            font_size=7, font_weight='bold')
-    if show_rates and sel:
-        elabels = {(u, v): f"{G.edges[u,v]['rate']:.1f}" for (u, v) in sel}
-        nx.draw_networkx_edge_labels(G, pos, ax=ax, edge_labels=elabels,
-                                     font_color=ec, font_size=6, alpha=0.8,
-                                     bbox=dict(alpha=0))
+                           node_color=ec,    node_size=280, alpha=0.75)
+    nx.draw_networkx_labels(G, pos, ax=ax,
+                            font_color='white', font_size=7, font_weight='bold')
     ax.axis('off')
 
 
-def rmean(arr, w=200):
-    if len(arr) < w:
-        return np.arange(len(arr)), np.array(arr, dtype=float)
-    ys = np.convolve(arr, np.ones(w)/w, mode='valid')
-    return np.arange(len(ys)), ys
-
-
-def plot_results(d):
-    fig = plt.figure(figsize=(22, 17))
+def plot_all(G, src, mon, res_m, res_g, k, stale_thresh):
+    fig = plt.figure(figsize=(22, 18))
     fig.patch.set_facecolor(DARK)
-    gs = gridspec.GridSpec(3, 3, figure=fig,
-                           hspace=0.48, wspace=0.36,
+    gs = gridspec.GridSpec(4, 3, figure=fig,
+                           hspace=0.50, wspace=0.36,
                            left=0.06, right=0.97,
-                           top=0.915, bottom=0.055)
+                           top=0.930, bottom=0.055)
 
-    G, src, mon, k = d['G'], d['src'], d['mon'], d['k']
     pos = nx.spring_layout(G, seed=7)
 
-    # ── Row 0: Topology panels ───────────────────────────────────────────────
+    # ── Compute static (no reselection) baselines ──────────────────────────
+    init_m = matroidal_select(G, k, src)
+    init_g = greedoidal_select(G, k, src)
+    st_mt, st_ma = run_ctmc_static(G, src, mon, init_m)
+    st_gt, st_ga = run_ctmc_static(G, src, mon, init_g)
+    f_m_init = freshness(G, init_m, src)
+    f_g_init = freshness(G, init_g, src)
+
+    # ── Row 0: Final topology panels ──────────────────────────────────────
     draw_topo(fig.add_subplot(gs[0, 0]), G, pos, list(G.edges()),
-              src, mon, GRAY, GRAY,
-              f"① Full Gossip Graph\n{G.number_of_nodes()} nodes · "
-              f"{G.number_of_edges()} edges  (link rates shown)",
-              show_rates=False)
+              src, mon, GRAY,
+              f"① Full Gossip Graph\n"
+              f"{G.number_of_nodes()} nodes · {G.number_of_edges()} edges")
 
-    draw_topo(fig.add_subplot(gs[0, 1]), G, pos, d['m_e'],
-              src, mon, BLUE, BLUE,
-              f"② Greedy (Matroidal = Greedoidal)  {len(d['m_e'])} links\n"
-              f"(1−1/e)·OPT ≥ {(1-1/np.e):.3f}  |  1/(1+α)·OPT ≥ {d['ab']:.3f}",
-              show_rates=True)
+    draw_topo(fig.add_subplot(gs[0, 1]), G, pos, res_m['final_active'],
+              src, mon, BLUE,
+              f"② Matroidal  (final link set)\n"
+              f"Reselections: {res_m['reselect_count']}  "
+              f"f={res_m['freshness_log'][-1]:.4f}")
 
-    draw_topo(fig.add_subplot(gs[0, 2]), G, pos, d['r_e'],
-              src, mon, ORANGE, ORANGE,
-              f"③ Rate-Heuristic (Naive)  {len(d['r_e'])} links\n"
-              f"Picks highest-λ edges — no submodular awareness",
-              show_rates=True)
+    draw_topo(fig.add_subplot(gs[0, 2]), G, pos, res_g['final_active'],
+              src, mon, GREEN,
+              f"③ Greedoidal  (final link set)\n"
+              f"Reselections: {res_g['reselect_count']}  "
+              f"f={res_g['freshness_log'][-1]:.4f}")
 
-    ax4 = fig.add_subplot(gs[1, 0:2])
-    sax(ax4, "④ Network Freshness f(S) vs Links Added"
-        "   [SHS Moment Equations — Diminishing Returns Verified]")
+    # ── Row 1: CTMC age traces ─────────────────────────────────────────────
+    ax_age = fig.add_subplot(gs[1, 0:3])
+    sax(ax_age,
+        "④ CTMC Version Age Trace  —  Adaptive vs Static  "
+        "[Red dashed = sensor trigger threshold]",
+        xlabel="Simulation Time (s)",
+        ylabel="Version Age  (source − monitor)")
 
-    f_all = d['f_all']
-    x_m = range(1, len(d['m_fh'])+1)
-    x_r = range(1, len(d['r_fh'])+1)
-    x_rand = range(1, len(d['rand_fh'])+1)
-
-    ax4.plot(x_m, d['m_fh'], 'o-', color=BLUE,   lw=2.4, ms=7,
-             label=f"Greedy (Matroid/Greedoid)  f_final={d['m_fh'][-1]:.4f}")
-    ax4.plot(x_r, d['r_fh'], 's-', color=ORANGE, lw=2.0, ms=6,
-             label=f"Rate Heuristic              f_final={d['r_fh'][-1]:.4f}")
-    ax4.plot(x_rand, d['rand_fh'], '^--', color=PURPLE, lw=1.6, ms=5,
-             label=f"Random                      f_final={d['rand_fh'][-1]:.4f}",
-             alpha=0.85)
-
-    ax4.axhline(f_all, color=GREEN, ls='--', lw=1.5, alpha=0.7,
-                label=f"All-links f={f_all:.4f}")
-    ax4.axhline(f_all * (1-1/np.e), color=BLUE, ls=':', lw=1.3, alpha=0.55,
-                label=f"(1−1/e)·f_all = {f_all*(1-1/np.e):.4f}")
-    ax4.axhline(f_all * d['ab'], color=GRAY, ls=':', lw=1.1, alpha=0.45,
-                label=f"1/(1+α)·f_all = {f_all*d['ab']:.4f}  (α={d['c']:.3f})")
-
-    ax4.set_xlabel("Links added (k)", fontsize=9)
-    ax4.set_ylabel("Freshness  f(S) = 1 / E[Version Age]", fontsize=9)
-    ax4.legend(facecolor=BG, edgecolor=GRID, labelcolor=GRAY, fontsize=8)
-    ax4.set_xlim(0.5, k+0.5)
-
-    ax5 = fig.add_subplot(gs[1, 2])
-    sax(ax5, "⑤ Marginal Gains  Δ(e|S)\n[Strict Diminishing Returns = Submodularity]")
-    w = 0.38
-    if d['m_gh']:
-        xs = np.arange(1, len(d['m_gh'])+1)
-        ax5.bar(xs-w/2, d['m_gh'], width=w, color=BLUE, alpha=0.82,
-                label='Greedy (submodular-aware)')
-    # Compute rate heuristic marginal gains post-hoc
-    r_gh = [freshness(G, d['r_e'][:i+1], src) -
-            freshness(G, d['r_e'][:i], src)
-            for i in range(len(d['r_e']))]
-    if r_gh:
-        xs2 = np.arange(1, len(r_gh)+1)
-        ax5.bar(xs2+w/2, r_gh, width=w, color=ORANGE, alpha=0.82,
-                label='Rate Heuristic')
-    ax5.set_xlabel("Step k", fontsize=9)
-    ax5.set_ylabel("Δ(e | S_{k−1})", fontsize=9)
-    ax5.legend(facecolor=BG, edgecolor=GRID, labelcolor=GRAY, fontsize=8)
-
-    # ── Row 2: CTMC panels ───────────────────────────────────────────────────
-    ax6 = fig.add_subplot(gs[2, 0:2])
-    sax(ax6, "⑥ CTMC: Steady-State Version Age vs Links Added"
-        "   [Greedy Converges to Low Age Fastest]")
-
-    if d['m_ca']:
-        ax6.plot(range(1,len(d['m_ca'])+1), d['m_ca'], 'o-',
-                 color=BLUE, lw=2.3, ms=6,
-                 label=f"Greedy (Matroid=Greedoid)  age={d['m_ca'][-1]:.2f}")
-    if d['r_ca']:
-        ax6.plot(range(1,len(d['r_ca'])+1), d['r_ca'], 's-',
-                 color=ORANGE, lw=2.0, ms=6,
-                 label=f"Rate Heuristic              age={d['r_ca'][-1]:.2f}")
-    if d['rand_ca']:
-        ax6.plot(range(1,len(d['rand_ca'])+1), d['rand_ca'], '^--',
-                 color=PURPLE, lw=1.6, ms=5, alpha=0.85,
-                 label=f"Random                      age={d['rand_ca'][-1]:.2f}")
-    ax6.set_xlabel("Links added (k)", fontsize=9)
-    ax6.set_ylabel("E[Version Age] at monitor node", fontsize=9)
-    ax6.legend(facecolor=BG, edgecolor=GRID, labelcolor=GRAY, fontsize=8)
-    ax6.set_xlim(0.5, k+0.5)
-    ax6.invert_yaxis()
-
-    ax7 = fig.add_subplot(gs[2, 2])
-    sax(ax7)
-    mu_m = float(np.mean(d['m_a'][max(1,len(d['m_a'])//2):]))
-    mu_r = float(np.mean(d['r_a'][max(1,len(d['r_a'])//2):]))
-    mu_rand = float(np.mean(d['rand_a'][max(1,len(d['rand_a'])//2):]))
-    mu_all  = float(np.mean(d['all_a'][max(1,len(d['all_a'])//2):]))
-    ax7.set_title("⑦ CTMC Age Trace  —  Policies Compared\n"
-                  "[Greedy achieves near-optimal steady-state age]",
-                  color='white', fontsize=9.5, fontweight='bold', pad=7)
-
-    for ta, aa, col, lbl, mu in [
-        (d['m_t'],    d['m_a'],    BLUE,   f"Greedy μ={mu_m:.2f}",     mu_m),
-        (d['r_t'],    d['r_a'],    ORANGE, f"Rate   μ={mu_r:.2f}",     mu_r),
-        (d['rand_t'], d['rand_a'], PURPLE, f"Random μ={mu_rand:.2f}",  mu_rand),
-        (d['all_t'],  d['all_a'],  GREEN,  f"All    μ={mu_all:.2f}",   mu_all),
+    for res, col, lbl in [
+        (res_m, BLUE,   "Matroidal (adaptive)"),
+        (res_g, GREEN,  "Greedoidal (adaptive)"),
     ]:
-        ax7.step(ta, aa, color=col, alpha=0.12, lw=0.4, where='post')
-        xi, yi = rmean(aa)
-        ax7.plot(ta[:len(yi)], yi, color=col, lw=1.8, label=lbl)
+        ax_age.step(res['times'], res['ages'],
+                    color=col, alpha=0.18, lw=0.5, where='post')
+        xi, yi = rmean(res['ages'])
+        ax_age.plot(res['times'][:len(yi)], yi,
+                    color=col, lw=2.2, label=lbl)
+        # Mark trigger events
+        if res['trigger_times']:
+            ax_age.scatter(res['trigger_times'], res['trigger_ages'],
+                           color=col, s=60, zorder=5, marker='^',
+                           edgecolors='white', linewidths=0.5, alpha=0.8)
 
-    # SHS predictions
-    shs_greedy = np.mean(d['node_ages_shs'])
-    ax7.axhline(shs_greedy, color=BLUE, ls=':', lw=1.2, alpha=0.6,
-                label=f"SHS E[Age] = {shs_greedy:.2f}")
+    # Static baselines (thin)
+    xi, yi = rmean(st_ma)
+    ax_age.plot(st_mt[:len(yi)], yi,
+                color=BLUE, lw=1.1, ls='--', alpha=0.45,
+                label='Matroidal (static, no reselection)')
+    xi, yi = rmean(st_ga)
+    ax_age.plot(st_gt[:len(yi)], yi,
+                color=GREEN, lw=1.1, ls='--', alpha=0.45,
+                label='Greedoidal (static, no reselection)')
 
-    ax7.set_xlabel("Simulation time (s)", fontsize=9)
-    ax7.set_ylabel("Version Age  (source − monitor)", fontsize=9)
-    ax7.legend(facecolor=BG, edgecolor=GRID, labelcolor=GRAY, fontsize=7.5)
+    ax_age.axhline(stale_thresh, color=RED, ls='--', lw=1.4, alpha=0.7,
+                   label=f'Stale threshold = {stale_thresh}')
+    ax_age.legend(facecolor=BG, edgecolor=GRID, labelcolor=GRAY, fontsize=8.5)
 
-    # ── Node age comparison inset ─────────────────────────────────────────────
-    # (Shown as annotation on panel 1)
-    ax1 = fig.axes[0]
-    shs_by_node = d['node_ages_shs']
-    ctmc_by_node = d['node_ages_ctmc']
-    colors_n = plt.cm.RdYlGn_r(
-        (shs_by_node - shs_by_node.min()) /
-        (shs_by_node.max() - shs_by_node.min() + 1e-9)
-    )
-    for i, (nx_pos, ny_pos) in pos.items():
-        age = shs_by_node[i]
-        ax1.annotate(f"E[X]={age:.1f}", (nx_pos, ny_pos),
-                     textcoords='offset points', xytext=(0, 14),
-                     fontsize=5.5, color='#aaaaaa', ha='center')
+    # ── Row 2: Freshness evolution + trigger map ───────────────────────────
+    ax_fr = fig.add_subplot(gs[2, 0:2])
+    sax(ax_fr,
+        "⑤ Freshness Score f(S) at Each Sensor Trigger  "
+        "[SHS re-evaluated on every detection]",
+        xlabel="Reselection Index",
+        ylabel="Freshness f(S) = 1 / E[Age]")
 
-    # ── Legend & suptitle ────────────────────────────────────────────────────
+    for res, col, lbl in [(res_m, BLUE, 'Matroidal'), (res_g, GREEN, 'Greedoidal')]:
+        fl = res['freshness_log']
+        ax_fr.plot(range(len(fl)), fl, 'o-', color=col, lw=2, ms=6, label=lbl)
+        ax_fr.fill_between(range(len(fl)), fl, alpha=0.08, color=col)
+
+    # Theoretical lower bounds
+    f_all = freshness(G, list(G.edges()), src)
+    ax_fr.axhline(f_all * (1 - 1/np.e), color=BLUE, ls=':', lw=1.3, alpha=0.55,
+                  label=f"(1−1/e)·f_all = {f_all*(1-1/np.e):.4f}")
+    ax_fr.axhline(f_all, color=ORANGE, ls='--', lw=1.2, alpha=0.55,
+                  label=f"All-links f = {f_all:.4f}")
+    ax_fr.legend(facecolor=BG, edgecolor=GRID, labelcolor=GRAY, fontsize=8.5)
+
+    # ── Row 2 right: Trigger timing ────────────────────────────────────────
+    ax_trig = fig.add_subplot(gs[2, 2])
+    sax(ax_trig,
+        "⑥ Sensor Trigger Timeline\n[When staleness threshold was hit]",
+        xlabel="Simulation Time (s)",
+        ylabel="Version Age at Trigger")
+
+    for res, col, lbl in [(res_m, BLUE, 'Matroidal'), (res_g, GREEN, 'Greedoidal')]:
+        if res['trigger_times']:
+            ax_trig.scatter(res['trigger_times'], res['trigger_ages'],
+                            color=col, s=70, label=lbl, zorder=4,
+                            edgecolors='white', linewidths=0.5)
+    ax_trig.axhline(stale_thresh, color=RED, ls='--', lw=1.2, alpha=0.7,
+                    label=f'Threshold={stale_thresh}')
+    ax_trig.legend(facecolor=BG, edgecolor=GRID, labelcolor=GRAY, fontsize=8.5)
+
+    # ── Row 3: Per-step marginal gains + reselection count bar ────────────
+    ax_mg = fig.add_subplot(gs[3, 0:2])
+    sax(ax_mg,
+        "⑦ Marginal Freshness Gain per Link Addition  "
+        "[Final Selection — Diminishing Returns Verified]",
+        xlabel="Step k",
+        ylabel="Δ f(S)")
+
+    def marginal_gains(G, edges, src):
+        gains = []
+        for i in range(len(edges)):
+            prev = freshness(G, edges[:i], src)
+            curr = freshness(G, edges[:i+1], src)
+            gains.append(curr - prev)
+        return gains
+
+    w = 0.38
+    mg_m = marginal_gains(G, res_m['final_active'], src)
+    mg_g = marginal_gains(G, res_g['final_active'], src)
+    xs = np.arange(1, max(len(mg_m), len(mg_g)) + 1)
+    if mg_m:
+        ax_mg.bar(xs[:len(mg_m)] - w/2, mg_m, width=w,
+                  color=BLUE, alpha=0.80, label='Matroidal')
+    if mg_g:
+        ax_mg.bar(xs[:len(mg_g)] + w/2, mg_g, width=w,
+                  color=GREEN, alpha=0.80, label='Greedoidal')
+    ax_mg.legend(facecolor=BG, edgecolor=GRID, labelcolor=GRAY, fontsize=8.5)
+
+    # ── Row 3 right: steady-state age comparison ───────────────────────────
+    ax_bar = fig.add_subplot(gs[3, 2])
+    sax(ax_bar,
+        "⑧ Steady-State Version Age Comparison\n[Lower is Better]",
+        ylabel="Mean Version Age (last 50%)")
+
+    cut = lambda a: int(len(a) * 0.5)
+    labels = ['Matroid\nAdaptive', 'Greedoid\nAdaptive',
+              'Matroid\nStatic',   'Greedoid\nStatic']
+    values = [
+        np.mean(res_m['ages'][cut(res_m['ages']):]),
+        np.mean(res_g['ages'][cut(res_g['ages']):]),
+        np.mean(st_ma[cut(st_ma):]),
+        np.mean(st_ga[cut(st_ga):]),
+    ]
+    cols   = [BLUE, GREEN, BLUE, GREEN]
+    alphas = [0.85, 0.85, 0.45, 0.45]
+    bars = []
+    for lbl, val, col, alp in zip(labels, values, cols, alphas):
+        b = ax_bar.bar(lbl, val, color=col, alpha=alp, edgecolor='white', linewidth=0.5)
+        bars.append(b[0])
+    for bar, val in zip(bars, values):
+        ax_bar.text(bar.get_x() + bar.get_width()/2, bar.get_height()+0.05,
+                    f'{val:.2f}', ha='center', va='bottom',
+                    color='white', fontsize=8, fontweight='bold')
+    ax_bar.tick_params(colors=GRAY, labelsize=7.5)
+
+    # ── Legend patches ──────────────────────────────────────────────────────
     pats = [
-        mpatches.Patch(color=GOLD,   label=f"Source (node {src})"),
-        mpatches.Patch(color=PINK,   label=f"Monitor (node {mon})"),
-        mpatches.Patch(color=BLUE,   label="Greedy (Matroid/Greedoid)"),
-        mpatches.Patch(color=ORANGE, label="Rate Heuristic"),
-        mpatches.Patch(color=PURPLE, label="Random Policy"),
-        mpatches.Patch(color=GREEN,  label="All Links (Oracle)"),
+        mpatches.Patch(color=GOLD,   label=f'Source (node {src})'),
+        mpatches.Patch(color=PINK,   label=f'Monitor (node {mon})'),
+        mpatches.Patch(color=BLUE,   label='Matroidal Greedy'),
+        mpatches.Patch(color=GREEN,  label='Greedoidal Greedy'),
+        mpatches.Patch(color=RED,    label=f'Stale threshold ({stale_thresh})'),
+        mpatches.Patch(color=ORANGE, label='All-links oracle'),
     ]
     fig.legend(handles=pats, loc='upper right',
-               bbox_to_anchor=(0.979, 0.965),
+               bbox_to_anchor=(0.978, 0.968),
                facecolor=BG, edgecolor=GRID,
                labelcolor=GRAY, fontsize=8.5)
 
+    mu_m = np.mean(res_m['ages'][cut(res_m['ages']):])
+    mu_g = np.mean(res_g['ages'][cut(res_g['ages']):])
+    winner = "Matroidal" if mu_m < mu_g else "Greedoidal"
+
     fig.suptitle(
-        "Version Age Minimization · SHS Moment Equations + CTMC Simulation\n"
-        f"Matroidal & Greedoidal Greedy vs Baselines  ·  "
-        f"n={G.number_of_nodes()} nodes  m={G.number_of_edges()} edges  k={k}  ·  "
-        f"curvature α={d['c']:.3f}  ·  "
-        f"(1−1/e)≈{1-1/np.e:.3f}  1/(1+α)={d['ab']:.3f}  ·  "
-        f"greedy/all-links = {d['m_fh'][-1]/d['f_all'] if d['f_all'] else 0:.3f}",
+        f"CTMC-Driven Adaptive Link Selection  ·  "
+        f"Sensor-Triggered SHS Re-Scoring  ·  Matroidal vs Greedoidal Greedy\n"
+        f"n={G.number_of_nodes()} nodes  m={G.number_of_edges()} edges  "
+        f"k={k} active links  ·  "
+        f"stale threshold={stale_thresh}  ·  "
+        f"{winner} achieves lower steady-state age  "
+        f"(Mat={mu_m:.2f}  Grd={mu_g:.2f})",
         color='white', fontsize=11, fontweight='bold', y=0.978
     )
-
-    out_dir = 'outputs'
-    if not os.path.exists(out_dir):
-        os.makedirs(out_dir)
-        
-    out = os.path.join(out_dir, 'version_age_simulation.png')
     
-    plt.savefig(out, dpi=155, bbox_inches='tight', facecolor=fig.get_facecolor())
-    print(f"\nSaved → {os.path.abspath(out)}")
+    output_dir = 'outputs'
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    # 2. Set the path to the local folder
+    out = os.path.join(output_dir, 'ctmc_adaptive_link_selection.png')
+    
+    # ... (your plotting code) ...
+    
+    # 3. Save using the figure object
+    fig = plt.gcf() # Get the current figure
+    fig.savefig(out, dpi=155, bbox_inches='tight', facecolor=fig.get_facecolor())
+    
+    print(f"Saved → {os.path.abspath(out)}")
     return fig
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Main
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# 7.  MAIN
+# ══════════════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
-    print("=" * 60)
-    print("  VERSION AGE  —  SHS + CTMC + SUBMODULAR LINK SELECTION")
-    print("=" * 60, "\n")
-    d = run_all(k=10)
-    plot_results(d)
+    print("=" * 62)
+    print("  CTMC-DRIVEN ADAPTIVE LINK SELECTION  (SHS + Sensor Loop)")
+    print("=" * 62, "\n")
+
+    G, src, mon = build_graph()
+    K              = 6        # link budget per selection round
+    STALE_THRESH   = 5        # age that triggers sensor alarm
+    COOLDOWN       = 8.0      # min seconds between reselections
+    T_MAX          = 300.0    # total simulation time
+
+    print(f"Graph: {G.number_of_nodes()} nodes  {G.number_of_edges()} edges  "
+          f"|  src={src}  mon={mon}  k={K}\n")
+
+    print("Running CTMC (Matroidal adaptive) ...")
+    res_m = run_ctmc_adaptive(G, src, mon, K,
+                              algo='matroid',
+                              stale_threshold=STALE_THRESH,
+                              reselect_cooldown=COOLDOWN,
+                              T_max=T_MAX, seed=42)
+
+    print("Running CTMC (Greedoidal adaptive) ...")
+    res_g = run_ctmc_adaptive(G, src, mon, K,
+                              algo='greedoid',
+                              stale_threshold=STALE_THRESH,
+                              reselect_cooldown=COOLDOWN,
+                              T_max=T_MAX, seed=42)
+
+    print("\nPlotting ...")
+    plot_all(G, src, mon, res_m, res_g, K, STALE_THRESH)
     print("Done.")
