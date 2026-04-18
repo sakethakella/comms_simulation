@@ -5,7 +5,7 @@ import networkx as nx
 def solve_shs(G, active_edges, src=0):
     n = G.number_of_nodes()
     A = np.zeros((n, n))
-    b = -np.ones(n)
+    b = np.zeros(n)
     for (u, v) in active_edges:
         r = G.edges[u, v]['rate']
         A[v, u] += r
